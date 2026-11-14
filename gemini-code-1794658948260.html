@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Motion Detector to Discord</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-zinc-950 text-zinc-100 min-h-screen flex flex-col items-center p-4 font-sans">
+
+  <div class="w-full max-w-md bg-zinc-900 border border-zinc-800 rounded-xl p-5 shadow-xl">
+    <h1 class="text-xl font-bold text-red-500 mb-1">Security Motion Cam</h1>
+    <p class="text-xs text-zinc-400 mb-4">ระบบตรวจจับความเคลื่อนไหวแจ้งเตือนเข้า Discord</p>
+
+    <!-- ช่องใส่ Webhook URL -->
+    <div class="mb-3">
+      <label class="block text-xs text-zinc-400 mb-1">Discord Webhook URL</label>
+      <input type="password" id="webhookUrl" placeholder="https://discord.com/api/webhooks/..." 
+        class="w-full bg-zinc-950 border border-zinc-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-red-500">
+    </div>
+
+    <!-- ตั้งค่าความไว (Sensitivity) & ดีเลย์ -->
+    <div class="grid grid-cols-2 gap-3 mb-4">
+      <div>
+        <label class="block text-xs text-zinc-400 mb-1">ความไว (ยิ่งน้อยยิ่งไว)</label>
+        <input type="number" id="sensitivity" value="30" min="5" max="100"
+          class="w-full bg-zinc-950 border border-zinc-700 rounded-lg px-3 py-2 text-sm">
+      </div>
+      <div>
+        <label class="block text-xs text-zinc-400 mb-1">ส่งซ้ำทุกๆ (วินาที)</label>
+        <input type="number" id="cooldown" value="10" min="3" max="300"
+          class="w-full bg-zinc-950 border border-zinc-700 rounded-lg px-3 py-2 text-sm">
+      </div>
+    </div>
+
+    <!-- หน้าจอแสดงผลกล้อง -->
+    <div class="relative w-full aspect-video bg-black rounded-lg overflow-hidden mb-4 border border-zinc-800">
+      <video id="video" autoplay playsinline muted class="w-full h-full object-cover"></video>
+      <div id="statusBadge" class="absolute top-2 left-2 bg-zinc-800/80 text-xs px-2 py-1 rounded text-zinc-300">
+        สถานะ: ปิดอยู่
+      </div>
+    </div>
+
+    <!-- ปุ่มควบคุม -->
+    <div class="flex gap-2">
+      <button id="startBtn" class="flex-1 bg-red-600 hover:bg-red-700 text-white font-semibold py-2.5 rounded-lg transition">
+        เริ่มตรวจจับ
+      </button>
+      <button id="stopBtn" disabled class="flex-1 bg-zinc-800 text-zinc-500 font-semibold py-2.5 rounded-lg transition">
+        หยุดทำงาน
+      </button>
+    </div>
+
+    <!-- Log การแจ้งเตือน -->
+    <div class="mt-4">
+      <p class="text-xs text-zinc-400 mb-1">บันทึกการทำงาน:</p>
+      <div id="logBox" class="bg-zinc-950 border border-zinc-800 rounded-lg p-2.5 h-28 overflow-y-auto text-xs font-mono text-zinc-400 space-y-1">
+        <div>พร้อมทำงาน...</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Canvas ซ่อนไว้สำหรับคำนวณ Pixel -->
+  <canvas id="canvas" class="hidden"></canvas>
+
+  <script>
+    const video = document.getElementById('video');
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    
+    const webhookInput = document.getElementById('webhookUrl');
+    const sensitivityInput = document.getElementById('sensitivity');
+    const cooldownInput = document.getElementById('cooldown');
+    const startBtn = document.getElementById('startBtn');
+    const stopBtn = document.getElementById('stopBtn');
+    const statusBadge = document.getElementById('statusBadge');
+    const logBox = document.getElementById('logBox');
+
+    let stream = null;
+    let detectInterval = null;
+    let prevFrameData = null;
+    let lastAlertTime = 0;
+
+    // โหลด Webhook เดิมที่เคยบันทึกไว้
+    if (localStorage.getItem('discord_webhook')) {
+      webhookInput.value = localStorage.getItem('discord_webhook');
+    }
+
+    function addLog(msg, isAlert = false) {
+      const time = new Date().toLocaleTimeString('th-TH');
+      const div = document.createElement('div');
+      div.className = isAlert ? 'text-red-400 font-bold' : '';
+      div.textContent = `[${time}] ${msg}`;
+      logBox.prepend(div);
+    }
+
+    // เปิดกล้อง (เลือกกล้องหลัง)
+    async function startCamera() {
+      const url = webhookInput.value.trim();
+      if (!url.startsWith('https://discord.com/api/webhooks/')) {
+        alert('กรุณาใส่ Discord Webhook URL ให้ถูกต้องครับ');
+        return;
+      }
+      localStorage.setItem('discord_webhook', url);
+
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: 'environment', width: { ideal: 640 }, height: { ideal: 480 } },
+          audio: false
+        });
+        video.srcObject = stream;
+        
+        video.onloadedmetadata = () => {
+          canvas.width = 160; // ย่อขนาดภาพตอนคำนวณเพื่อไม่ให้มือถือเก่าค้าง
+          canvas.height = 120;
+          
+          startBtn.disabled = true;
+          startBtn.classList.replace('bg-red-600', 'bg-zinc-800');
+          startBtn.classList.replace('text-white', 'text-zinc-500');
+          
+          stopBtn.disabled = false;
+          stopBtn.classList.replace('bg-zinc-800', 'bg-zinc-700');
+          stopBtn.classList.replace('text-zinc-500', 'text-white');
+
+          statusBadge.textContent = 'สถานะ: กำลังเฝ้าระวัง...';
+          statusBadge.className = 'absolute top-2 left-2 bg-red-600/90 text-xs px-2 py-1 rounded text-white animate-pulse';
+          
+          addLog('เริ่มระบบตรวจจับความเคลื่อนไหว');
+          detectInterval = setInterval(checkMotion, 300); // เช็คทุกๆ 0.3 วินาที
+        };
+      } catch (err) {
+        alert('ไม่สามารถเปิดกล้องได้: ' + err.message);
+      }
+    }
+
+    // หยุดทำงาน
+    function stopCamera() {
+      clearInterval(detectInterval);
+      if (stream) {
+        stream.getTracks().forEach(track => track.stop());
+      }
+      prevFrameData = null;
+      
+      startBtn.disabled = false;
+      startBtn.classList.replace('bg-zinc-800', 'bg-red-600');
+      startBtn.classList.replace('text-zinc-500', 'text-white');
+      
+      stopBtn.disabled = true;
+      stopBtn.classList.replace('bg-zinc-700', 'bg-zinc-800');
+      stopBtn.classList.replace('text-white', 'text-zinc-500');
+
+      statusBadge.textContent = 'สถานะ: ปิดอยู่';
+      statusBadge.className = 'absolute top-2 left-2 bg-zinc-800/80 text-xs px-2 py-1 rounded text-zinc-300';
+      addLog('หยุดการทำงานแล้ว');
+    }
+
+    // ฟังก์ชันเปรียบเทียบเฟรมภาพ
+    function checkMotion() {
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      const currentFrame = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+
+      if (!prevFrameData) {
+        prevFrameData = currentFrame;
+        return;
+      }
+
+      let diffPixels = 0;
+      const threshold = parseInt(sensitivityInput.value) || 30; // ความต่างของค่าสี
+      const totalPixels = currentFrame.length / 4;
+
+      for (let i = 0; i < currentFrame.length; i += 4) {
+        const rDiff = Math.abs(currentFrame[i] - prevFrameData[i]);
+        const gDiff = Math.abs(currentFrame[i + 1] - prevFrameData[i + 1]);
+        const bDiff = Math.abs(currentFrame[i + 2] - prevFrameData[i + 2]);
+
+        if ((rDiff + gDiff + bDiff) / 3 > threshold) {
+          diffPixels++;
+        }
+      }
+
+      prevFrameData = currentFrame;
+
+      // ถ้าพิกเซลเปลี่ยนเกิน 3% ของหน้าจอ ถือว่ามีการเคลื่อนไหว
+      const changedPercent = (diffPixels / totalPixels) * 100;
+      if (changedPercent > 3) {
+        const now = Date.now();
+        const cooldownMs = (parseInt(cooldownInput.value) || 10) * 1000;
+
+        if (now - lastAlertTime > cooldownMs) {
+          lastAlertTime = now;
+          addLog(`ตรวจพบการเคลื่อนไหว! (${changedPercent.toFixed(1)}%) กำลังส่งรูป...`, true);
+          captureAndSendToDiscord();
+        }
+      }
+    }
+
+    // แคปภาพความละเอียดเต็มแล้วส่งเข้า Discord
+    function captureAndSendToDiscord() {
+      const snapCanvas = document.createElement('canvas');
+      snapCanvas.width = video.videoWidth;
+      snapCanvas.height = video.videoHeight;
+      snapCanvas.getContext('2d').drawImage(video, 0, 0);
+
+      snapCanvas.toBlob(async (blob) => {
+        const formData = new FormData();
+        const timeStr = new Date().toLocaleString('th-TH');
+        
+        formData.append('content', `🚨 **ตรวจพบความเคลื่อนไหว!**\nเวลา: \`${timeStr}\``);
+        formData.append('file', blob, `motion_${Date.now()}.jpg`);
+
+        try {
+          const res = await fetch(webhookInput.value.trim(), {
+            method: 'POST',
+            body: formData
+          });
+          if (res.ok) {
+            addLog('ส่งรูปเข้า Discord สำเร็จ');
+          } else {
+            addLog('ส่งไม่สำเร็จ (Error: ' + res.status + ')');
+          }
+        } catch (err) {
+          addLog('เกิดข้อผิดพลาดในการเชื่อมต่อ');
+        }
+      }, 'image/jpeg', 0.8);
+    }
+
+    startBtn.addEventListener('click', startCamera);
+    stopBtn.addEventListener('click', stopCamera);
+  </script>
+</body>
+</html>
